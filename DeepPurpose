@@ -1,0 +1,119 @@
+!pip install pubchempy
+!pip install DeepPurpose
+!pip install rdkit
+!pip install git+https://github.com/bp-kelley/descriptastorus
+!pip install pandas-flavor
+!pip install gradio
+!pip install Bio
+
+# Import the libraries
+import numpy as np
+import pandas as pd
+from DeepPurpose import utils
+from DeepPurpose import DTI as models
+import gradio as gr
+import requests
+from Bio import SeqIO
+from io import StringIO
+import pubchempy as pc
+
+# Load the pretrained models for different datasets
+model_binding = models.model_pretrained(model='MPNN_CNN_BindingDB')
+model_kiba = models.model_pretrained(model='MPNN_CNN_KIBA')
+model_davis = models.model_pretrained(model='MPNN_CNN_DAVIS')
+
+def fetch_pdb_sequence(pdb_code):
+    try:
+        # Fetch the PDB file from RCSB PDB website
+        pdb_url = f"https://files.rcsb.org/download/{pdb_code.lower()}.pdb"
+        response = requests.get(pdb_url)
+
+        # Check if the request was successful
+        if response.status_code == 200:
+            # Parse the response content as a PDB file
+            pdb_content = response.text
+            pdb_file = StringIO(pdb_content)
+
+            # Parse the PDB file and extract the target sequence
+            target_sequence = ""
+            for structure in SeqIO.parse(pdb_file, "pdb-seqres"):
+                target_sequence += str(structure.seq)
+            return target_sequence
+        else:
+            return f"Error: PDB code {pdb_code} not found."
+    except Exception as e:
+        return f"Error fetching sequence for PDB code {pdb_code}: {str(e)}"
+
+def get_smiles_from_name(chemical_name):
+    try:
+        compound = pc.get_compounds(chemical_name, 'name')
+        if compound:
+            return compound[0].canonical_smiles
+        else:
+            return None
+    except Exception as e:
+        return f"Error fetching SMILES for {chemical_name}: {str(e)}"
+
+def DTI_pred(data, drug_type, drug_input, target_type, target_input):
+    """
+    This function predicts the drug-target interaction affinity for a given dataset, drug, and target.
+    Parameters:
+    - data: the name of the dataset to use for the prediction, one of ['BindingDB', 'DAVIS', 'KIBA']
+    - drug_type: the type of drug input, either 'SMILES' or 'Chemical Names'
+    - drug_input: a string of one or more drugs in SMILES format or chemical names, separated by comma
+    - target_type: the type of target input, either 'Sequence' or 'PDB Code'
+    - target_input: the target input (either amino acid sequence or PDB code)
+    Returns:
+    - a string of the predicted affinities for each drug, separated by comma
+    """
+    if target_type == 'Sequence':
+        target = target_input
+    elif target_type == 'PDB Code':
+        target = fetch_pdb_sequence(target_input)
+        if "Error" in target:
+            return target
+
+    # Process the drug data based on the input type
+    if drug_type == 'SMILES':
+        drugs = drug_input.split(",")
+    elif drug_type == 'Chemical Names':
+        # Convert chemical names to SMILES using PubChem API
+        drugs = [get_smiles_from_name(name.strip()) for name in drug_input.split(",")]
+        # Remove any None values from the list
+        drugs = [smiles for smiles in drugs if smiles]
+
+    # Select the model based on the data
+    if data == 'BindingDB':
+        model = model_binding
+    elif data == 'KIBA':
+        model = model_kiba
+    elif data == 'DAVIS':
+        model = model_davis
+
+    # Create an empty list to store the predictions
+    predictions = []
+    # Loop through each drug in the list
+    for drug in drugs:
+        # Process the drug and target data
+        X_pred = utils.data_process(X_drug=[drug], X_target=[target], y=[0],
+                                    drug_encoding='MPNN', target_encoding='CNN',
+                                    split_method='no_split')
+        # Predict the affinity for the drug and target pair
+        y_pred = model.predict(X_pred)
+        # Append the prediction to the list
+        predictions.append(str(y_pred[0]))
+    # Join the predictions by comma and return the result
+    return ", ".join(predictions)
+
+# Create a Gradio interface with the inputs, outputs, and title
+interface = gr.Interface(fn=DTI_pred,
+                         inputs=[gr.Dropdown(label="Training Dataset", choices=['BindingDB', 'DAVIS', 'KIBA']),
+                                 gr.Dropdown(label="Drug Input Type", choices=['SMILES', 'Chemical Names']),
+                                 gr.Textbox(lines=5, label="Drug Input (separated by comma)"),
+                                 gr.Radio(label="Target Input Type", choices=['Sequence', 'PDB Code']),
+                                 gr.Textbox(lines=5, label="Target Sequence/PDB Code")],
+                         outputs=gr.Textbox(label="Predicted Affinities"),
+                         title="Drug-Target Interaction Prediction with DeepPurpose")
+
+# Launch the interface
+interface.launch()
